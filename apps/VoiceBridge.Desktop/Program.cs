@@ -39,6 +39,7 @@ internal sealed class TrayAppContext : ApplicationContext
     private readonly GlobalKeyboardHook _keyboard;
     private readonly StatusOverlay _overlay;
     private AudioRecorder? _recorder;
+    private CancellationTokenSource? _recognitionCts;
     private bool _recording;
     private bool _recognizing;
     private string _lastText = string.Empty;
@@ -46,6 +47,7 @@ internal sealed class TrayAppContext : ApplicationContext
     public TrayAppContext()
     {
         _config = ConfigStore.Load();
+        _config.Endpoint = EndpointUtil.NormalizeBaseEndpoint(_config.Endpoint);
         _logger = new AppLogger();
         _history = new HistoryStore();
         _appIcon = AppIconFactory.CreateIcon();
@@ -67,6 +69,7 @@ internal sealed class TrayAppContext : ApplicationContext
         _keyboard.KeyUp += HandleKeyUp;
         _keyboard.Start();
         _logger.Info("VoiceBridge started.");
+        _logger.Info($"Runtime config: endpoint={_config.Endpoint}, model={_config.ModelName}, timeout={_config.TimeoutSeconds}s, hotkey={_config.HoldKey}");
     }
 
     private ContextMenuStrip BuildMenu()
@@ -88,9 +91,10 @@ internal sealed class TrayAppContext : ApplicationContext
             using var form = new SettingsForm(_config);
             if (form.ShowDialog() == DialogResult.OK)
             {
+                _config.Endpoint = EndpointUtil.NormalizeBaseEndpoint(_config.Endpoint);
                 ConfigStore.Save(_config);
                 ApplyRuntimeSettings(showTip: true);
-                _logger.Info("Settings saved and applied from UI.");
+                _logger.Info($"Settings saved and applied from UI. endpoint={_config.Endpoint}, model={_config.ModelName}, timeout={_config.TimeoutSeconds}s, hotkey={_config.HoldKey}");
             }
         }
         catch (Exception ex)
@@ -114,16 +118,35 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void HandleKeyDown(Keys key)
     {
-        if (key == _config.HoldKey && !_recording && !_recognizing)
+        if (key == _config.HoldKey)
         {
+            if (_recording) return;
+            if (_recognizing)
+            {
+                ShowOverlay("正在识别中", "模型还在处理上一段语音，请稍等或按 Esc 取消。", OverlayKind.Recognizing, 1600);
+                _logger.Info("Ignored hotkey because recognition is still running.");
+                return;
+            }
+
             BeginRecord();
             return;
         }
 
-        if (key == Keys.Escape && _recording)
+        if (key == Keys.Escape)
         {
-            CancelRecord();
-            return;
+            if (_recording)
+            {
+                CancelRecord();
+                return;
+            }
+
+            if (_recognizing)
+            {
+                _recognitionCts?.Cancel();
+                ShowOverlay("正在取消", "已发送取消信号。", OverlayKind.Info, 1200);
+                _logger.Info("Recognition cancellation requested by Esc.");
+                return;
+            }
         }
 
         if (key == Keys.F9 && !_recording && !_recognizing)
@@ -156,8 +179,8 @@ internal sealed class TrayAppContext : ApplicationContext
             _recorder = new AudioRecorder(_config.MicrophoneDeviceNumber, _config.SampleRate, _config.Channels, _logger);
             _recorder.Start();
             _tray.Text = "VoiceBridge 正在录音...";
-            ShowOverlay("正在录音", $"{_config.HoldKey} 松开后识别 · {_config.ModelName}", OverlayKind.Recording);
-            _logger.Info("Recording started.");
+            ShowOverlay("正在录音", $"松开 {_config.HoldKey} 后发送给 {_config.ModelName}", OverlayKind.Recording);
+            _logger.Info($"Recording started. device={_config.MicrophoneDeviceNumber}, sampleRate={_config.SampleRate}, channels={_config.Channels}");
         }
         catch (Exception ex)
         {
@@ -186,13 +209,27 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private async Task StopAndTranscribeAsync()
     {
+        var total = Stopwatch.StartNew();
+        var phase = new RecognitionProgress("正在准备", "停止录音并准备音频", OverlayKind.Recognizing);
+        using var progressTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+
         try
         {
             _recording = false;
             _recognizing = true;
+            _recognitionCts = new CancellationTokenSource();
             _tray.Text = "VoiceBridge 正在识别...";
-            ShowOverlay("正在识别", $"{_config.ModelName} · {_config.Endpoint}", OverlayKind.Recognizing);
 
+            progressTimer.Tick += (_, _) => ShowOverlay(phase.Title, WithElapsed(phase.Detail, total), phase.Kind);
+            progressTimer.Start();
+
+            var progress = new Progress<RecognitionProgress>(p =>
+            {
+                phase = p;
+                ShowOverlay(p.Title, WithElapsed(p.Detail, total), p.Kind, p.AutoHideMs);
+            });
+
+            ((IProgress<RecognitionProgress>)progress).Report(new RecognitionProgress("正在处理音频", "录音已结束，正在写入 wav 文件", OverlayKind.Recognizing));
             var wav = await (_recorder?.StopAsync() ?? Task.FromResult(string.Empty));
             if (string.IsNullOrWhiteSpace(wav) || !File.Exists(wav))
             {
@@ -200,31 +237,45 @@ internal sealed class TrayAppContext : ApplicationContext
                 return;
             }
 
+            var duration = AudioRecorder.TryGetDuration(wav);
+            _logger.Info($"Recording stopped. file={wav}, duration={duration.TotalSeconds:F2}s, size={FileUtil.FormatBytes(new FileInfo(wav).Length)}");
+
             var client = new AsrClient(_config, _logger);
-            var text = await client.TranscribeAsync(wav);
+            var text = await client.TranscribeAsync(wav, progress, _recognitionCts.Token);
+            ((IProgress<RecognitionProgress>)progress).Report(new RecognitionProgress("正在后处理", "清理模型输出并应用技术词替换", OverlayKind.Recognizing));
             text = TextPostProcessor.Process(text, _config.EnablePostProcess);
 
             if (string.IsNullOrWhiteSpace(text))
             {
                 ShowOverlay("未识别到文本", "请靠近麦克风或检查输入设备", OverlayKind.Info, 2200);
                 _tray.ShowBalloonTip(2000, "VoiceBridge", "没有识别到文本", ToolTipIcon.Info);
+                _logger.Info($"Recognition returned empty text. elapsed={total.Elapsed.TotalSeconds:F2}s");
                 return;
             }
 
             _lastText = text;
             _history.Add(text);
+            ((IProgress<RecognitionProgress>)progress).Report(new RecognitionProgress("正在输入", "识别完成，正在粘贴到当前窗口", OverlayKind.Recognizing));
             await InputInjector.PasteTextAsync(text, _config.RestoreClipboard);
-            ShowOverlay("已输入", Shorten(text, 80), OverlayKind.Success, 2200);
-            _logger.Info("Recognition completed: " + text);
+            ShowOverlay("已输入", $"{Shorten(text, 80)} · 总耗时 {total.Elapsed.TotalSeconds:F1}s", OverlayKind.Success, 2600);
+            _logger.Info($"Recognition completed in {total.Elapsed.TotalSeconds:F2}s: {text}");
+        }
+        catch (OperationCanceledException ex)
+        {
+            _logger.Error("Recognition cancelled or timed out", ex);
+            ShowOverlay("识别已取消或超时", $"已用时 {total.Elapsed.TotalSeconds:F1}s；可调大超时时间或检查模型服务。", OverlayKind.Error, 3600);
         }
         catch (Exception ex)
         {
             _logger.Error("Recognition failed", ex);
-            ShowOverlay("识别失败", ex.Message, OverlayKind.Error, 3600);
-            _tray.ShowBalloonTip(3000, "VoiceBridge", "识别失败：" + ex.Message, ToolTipIcon.Error);
+            ShowOverlay("识别失败", FriendlyError(ex.Message), OverlayKind.Error, 4200);
+            _tray.ShowBalloonTip(3000, "VoiceBridge", "识别失败：" + FriendlyError(ex.Message), ToolTipIcon.Error);
         }
         finally
         {
+            progressTimer.Stop();
+            _recognitionCts?.Dispose();
+            _recognitionCts = null;
             _recognizing = false;
             _tray.Text = "VoiceBridge 语音桥";
         }
@@ -248,6 +299,16 @@ internal sealed class TrayAppContext : ApplicationContext
         _overlay.ShowStatus(title, detail, kind, autoHideMs);
     }
 
+    private static string WithElapsed(string detail, Stopwatch watch) => $"{detail} · 已用时 {watch.Elapsed.TotalSeconds:F0}s";
+
+    private static string FriendlyError(string message)
+    {
+        if (message.Contains("502", StringComparison.OrdinalIgnoreCase)) return "502 Bad Gateway：服务端网关或模型服务异常，请检查 vLLM/反向代理日志。";
+        if (message.Contains("refused", StringComparison.OrdinalIgnoreCase) || message.Contains("积极拒绝", StringComparison.OrdinalIgnoreCase)) return "连接被拒绝：服务地址不通或端口没有监听。";
+        if (message.Contains("timed out", StringComparison.OrdinalIgnoreCase) || message.Contains("超时", StringComparison.OrdinalIgnoreCase)) return "请求超时：模型响应慢或超时时间太短。";
+        return Shorten(message.Replace("\r", " ").Replace("\n", " "), 160);
+    }
+
     private static string Shorten(string text, int max)
     {
         text = text.Replace("\r", " ").Replace("\n", " ").Trim();
@@ -258,6 +319,8 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         if (disposing)
         {
+            _recognitionCts?.Cancel();
+            _recognitionCts?.Dispose();
             _keyboard.Dispose();
             _overlay.Dispose();
             _tray.Visible = false;
@@ -286,6 +349,29 @@ internal sealed class AppConfig
     public int MaxTokens { get; set; } = 2048;
 }
 
+internal sealed record RecognitionProgress(string Title, string Detail, OverlayKind Kind, int AutoHideMs = 0);
+
+internal static class EndpointUtil
+{
+    public static string NormalizeBaseEndpoint(string endpoint)
+    {
+        var value = (endpoint ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(value)) value = "http://127.0.0.1:8004";
+        if (!value.StartsWith("http://", StringComparison.OrdinalIgnoreCase) && !value.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            value = "http://" + value;
+        }
+
+        value = value.TrimEnd('/');
+        if (value.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)) value = value[..^3].TrimEnd('/');
+        return value;
+    }
+
+    public static string ModelsUrl(string endpoint) => NormalizeBaseEndpoint(endpoint) + "/v1/models";
+
+    public static string ChatCompletionsUrl(string endpoint) => NormalizeBaseEndpoint(endpoint) + "/v1/chat/completions";
+}
+
 internal static class ConfigStore
 {
     private static readonly string Dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VoiceBridge");
@@ -303,7 +389,9 @@ internal static class ConfigStore
 
         try
         {
-            return JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(PathName)) ?? new AppConfig();
+            var cfg = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(PathName, Encoding.UTF8)) ?? new AppConfig();
+            cfg.Endpoint = EndpointUtil.NormalizeBaseEndpoint(cfg.Endpoint);
+            return cfg;
         }
         catch
         {
@@ -314,7 +402,8 @@ internal static class ConfigStore
     public static void Save(AppConfig config)
     {
         Directory.CreateDirectory(Dir);
-        File.WriteAllText(PathName, JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }));
+        config.Endpoint = EndpointUtil.NormalizeBaseEndpoint(config.Endpoint);
+        File.WriteAllText(PathName, JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
     }
 }
 
@@ -323,8 +412,8 @@ internal sealed class SettingsForm : Form
     public SettingsForm(AppConfig config)
     {
         Text = "VoiceBridge - 设置";
-        Width = 660;
-        Height = 590;
+        Width = 720;
+        Height = 660;
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
@@ -332,10 +421,11 @@ internal sealed class SettingsForm : Form
         Icon = AppIconFactory.CreateIcon();
 
         var endpoint = TextBox(config.Endpoint);
+        endpoint.PlaceholderText = "例如 36.147.35.14:30081 或 http://36.147.35.14:30081";
         var model = TextBox(config.ModelName);
         var apiKey = TextBox(config.ApiKey); apiKey.UseSystemPasswordChar = true;
-        var timeout = Numeric(config.TimeoutSeconds, 5, 600);
-        var mic = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 420 };
+        var timeout = Numeric(config.TimeoutSeconds, 5, 900);
+        var mic = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 460 };
         mic.Items.Add(new DeviceItem(-1, "系统默认麦克风"));
         for (var i = 0; i < WaveInEvent.DeviceCount; i++)
         {
@@ -352,11 +442,11 @@ internal sealed class SettingsForm : Form
         var restoreClipboard = new CheckBox { Text = "粘贴后恢复原剪贴板", Checked = config.RestoreClipboard, AutoSize = true };
         var postProcess = new CheckBox { Text = "启用技术词后处理", Checked = config.EnablePostProcess, AutoSize = true };
         var showOverlay = new CheckBox { Text = "显示语音状态浮窗", Checked = config.ShowOverlay, AutoSize = true };
-        var prompt = new TextBox { Text = config.Prompt, Multiline = true, Width = 420, Height = 70, ScrollBars = ScrollBars.Vertical };
+        var prompt = new TextBox { Text = config.Prompt, Multiline = true, Width = 460, Height = 84, ScrollBars = ScrollBars.Vertical };
         var maxTokens = Numeric(config.MaxTokens, 64, 8192);
 
         var table = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 2, RowCount = 12 };
-        table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 160));
+        table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         AddRow(table, "服务地址", endpoint);
         AddRow(table, "模型名称", model);
@@ -374,9 +464,9 @@ internal sealed class SettingsForm : Form
         var hint = new Label
         {
             Dock = DockStyle.Bottom,
-            Height = 34,
+            Height = 48,
             Padding = new Padding(16, 4, 16, 4),
-            Text = "保存后立即热加载：热键、模型地址、API Key、超时时间、麦克风等均不需要重启。"
+            Text = "服务地址可填 IP:端口，保存时自动补 http://；不要填写 /v1/chat/completions。保存后热加载，无需重启。"
         };
 
         var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Bottom, Height = 52, Padding = new Padding(8) };
@@ -388,7 +478,7 @@ internal sealed class SettingsForm : Form
 
         ok.Click += (_, _) =>
         {
-            config.Endpoint = endpoint.Text.Trim().TrimEnd('/');
+            config.Endpoint = EndpointUtil.NormalizeBaseEndpoint(endpoint.Text);
             config.ModelName = model.Text.Trim();
             config.ApiKey = apiKey.Text.Trim();
             config.TimeoutSeconds = (int)timeout.Value;
@@ -402,12 +492,14 @@ internal sealed class SettingsForm : Form
             config.MaxTokens = (int)maxTokens.Value;
         };
 
+        AcceptButton = ok;
+        CancelButton = cancel;
         Controls.Add(table);
         Controls.Add(hint);
         Controls.Add(buttons);
     }
 
-    private static TextBox TextBox(string text) => new() { Text = text, Width = 420 };
+    private static TextBox TextBox(string text) => new() { Text = text, Width = 460 };
 
     private static NumericUpDown Numeric(int value, int min, int max)
     {
@@ -440,18 +532,27 @@ internal sealed class SettingsForm : Form
 
     private static async Task TestEndpointAsync(string endpoint, string apiKey)
     {
+        var sw = Stopwatch.StartNew();
+        var normalized = EndpointUtil.NormalizeBaseEndpoint(endpoint);
         try
         {
             using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
             if (!string.IsNullOrWhiteSpace(apiKey)) client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-            var resp = await client.GetAsync(endpoint.TrimEnd('/') + "/v1/models");
-            MessageBox.Show(resp.IsSuccessStatusCode ? "连接成功" : $"连接失败：{(int)resp.StatusCode} {resp.ReasonPhrase}", "VoiceBridge");
+            var url = EndpointUtil.ModelsUrl(normalized);
+            var resp = await client.GetAsync(url);
+            var body = await resp.Content.ReadAsStringAsync();
+            var msg = resp.IsSuccessStatusCode
+                ? $"连接成功\n\n地址：{normalized}\n接口：{url}\n耗时：{sw.Elapsed.TotalMilliseconds:F0} ms"
+                : $"连接失败：{(int)resp.StatusCode} {resp.ReasonPhrase}\n\n地址：{normalized}\n接口：{url}\n耗时：{sw.Elapsed.TotalMilliseconds:F0} ms\n\n{TrimBody(body)}";
+            MessageBox.Show(msg, "VoiceBridge");
         }
         catch (Exception ex)
         {
-            MessageBox.Show("连接失败：" + ex.Message, "VoiceBridge");
+            MessageBox.Show($"连接失败：{ex.Message}\n\n地址：{normalized}\n接口：{EndpointUtil.ModelsUrl(normalized)}", "VoiceBridge");
         }
     }
+
+    private static string TrimBody(string body) => string.IsNullOrWhiteSpace(body) ? string.Empty : (body.Length <= 800 ? body : body[..800] + "…");
 
     private sealed record DeviceItem(int Number, string Name)
     {
@@ -467,8 +568,8 @@ internal sealed class StatusOverlay : Form
 
     public StatusOverlay()
     {
-        Width = 420;
-        Height = 96;
+        Width = 500;
+        Height = 108;
         StartPosition = FormStartPosition.Manual;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
@@ -481,7 +582,7 @@ internal sealed class StatusOverlay : Form
         _title = new Label
         {
             Dock = DockStyle.Top,
-            Height = 32,
+            Height = 34,
             ForeColor = Color.White,
             Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 12, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft
@@ -505,6 +606,12 @@ internal sealed class StatusOverlay : Form
 
     public void ShowStatus(string title, string detail, OverlayKind kind, int autoHideMs = 0)
     {
+        if (InvokeRequired)
+        {
+            BeginInvoke(() => ShowStatus(title, detail, kind, autoHideMs));
+            return;
+        }
+
         _title.Text = IconText(kind) + " " + title;
         _detail.Text = detail;
         Location = CalculateLocation();
@@ -531,7 +638,7 @@ internal sealed class StatusOverlay : Form
     private static Point CalculateLocation()
     {
         var area = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1280, 720);
-        return new Point(area.Left + (area.Width - 420) / 2, area.Bottom - 150);
+        return new Point(area.Left + (area.Width - 500) / 2, area.Bottom - 160);
     }
 
     private static string IconText(OverlayKind kind) => kind switch
@@ -652,6 +759,19 @@ internal sealed class AudioRecorder
         _waveIn?.StopRecording();
         try { if (File.Exists(_path)) File.Delete(_path); } catch (Exception ex) { _logger.Error("Delete cancelled recording failed", ex); }
     }
+
+    public static TimeSpan TryGetDuration(string wavPath)
+    {
+        try
+        {
+            using var reader = new WaveFileReader(wavPath);
+            return reader.TotalTime;
+        }
+        catch
+        {
+            return TimeSpan.Zero;
+        }
+    }
 }
 
 internal sealed class AsrClient
@@ -665,11 +785,20 @@ internal sealed class AsrClient
         _logger = logger;
     }
 
-    public async Task<string> TranscribeAsync(string wavPath)
+    public async Task<string> TranscribeAsync(string wavPath, IProgress<RecognitionProgress>? progress, CancellationToken cancellationToken)
     {
+        var total = Stopwatch.StartNew();
+        var endpoint = EndpointUtil.NormalizeBaseEndpoint(_config.Endpoint);
+        var url = EndpointUtil.ChatCompletionsUrl(endpoint);
+
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(_config.TimeoutSeconds) };
         if (!string.IsNullOrWhiteSpace(_config.ApiKey)) http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _config.ApiKey);
-        var data = Convert.ToBase64String(await File.ReadAllBytesAsync(wavPath));
+
+        progress?.Report(new RecognitionProgress("正在编码音频", $"读取 wav 并转 base64，超时 {_config.TimeoutSeconds}s", OverlayKind.Recognizing));
+        var audioBytes = await File.ReadAllBytesAsync(wavPath, cancellationToken);
+        var data = Convert.ToBase64String(audioBytes);
+        _logger.Info($"Audio prepared. file={Path.GetFileName(wavPath)}, size={FileUtil.FormatBytes(audioBytes.Length)}, base64={FileUtil.FormatBytes(data.Length)}, endpoint={endpoint}, model={_config.ModelName}");
+
         var payload = new
         {
             model = _config.ModelName,
@@ -691,12 +820,28 @@ internal sealed class AsrClient
         };
 
         var json = JsonSerializer.Serialize(payload);
-        var url = _config.Endpoint.TrimEnd('/') + "/v1/chat/completions";
-        _logger.Info("POST " + url);
-        var resp = await http.PostAsync(url, new StringContent(json, Encoding.UTF8, "application/json"));
-        var body = await resp.Content.ReadAsStringAsync();
-        if (!resp.IsSuccessStatusCode) throw new InvalidOperationException($"ASR failed: {(int)resp.StatusCode} {resp.ReasonPhrase}\n{body}");
-        return ExtractText(body);
+        _logger.Info($"POST {url}; payload={FileUtil.FormatBytes(Encoding.UTF8.GetByteCount(json))}; timeout={_config.TimeoutSeconds}s");
+        progress?.Report(new RecognitionProgress("正在请求模型", $"已发送到 {_config.ModelName}，等待 ASR 返回", OverlayKind.Recognizing));
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json")
+        };
+        var resp = await http.SendAsync(req, cancellationToken);
+        var body = await resp.Content.ReadAsStringAsync(cancellationToken);
+        _logger.Info($"ASR response received. status={(int)resp.StatusCode} {resp.ReasonPhrase}; elapsed={total.Elapsed.TotalSeconds:F2}s; body={FileUtil.FormatBytes(Encoding.UTF8.GetByteCount(body))}");
+
+        if (!resp.IsSuccessStatusCode)
+        {
+            var trimmed = body.Length <= 1200 ? body : body[..1200] + "…";
+            _logger.Info("ASR non-success body: " + trimmed);
+            throw new InvalidOperationException($"ASR failed: {(int)resp.StatusCode} {resp.ReasonPhrase}\n{trimmed}");
+        }
+
+        progress?.Report(new RecognitionProgress("正在解析结果", "模型已返回，正在提取文本", OverlayKind.Recognizing));
+        var text = ExtractText(body);
+        _logger.Info($"ASR text extracted. elapsed={total.Elapsed.TotalSeconds:F2}s; chars={text.Length}");
+        return text;
     }
 
     private static string ExtractText(string json)
@@ -778,6 +923,7 @@ internal sealed class GlobalKeyboardHook : IDisposable
     public event Action<Keys>? KeyDown;
     public event Action<Keys>? KeyUp;
     private readonly LowLevelKeyboardProc _proc;
+    private readonly HashSet<Keys> _pressed = new();
     private IntPtr _hook;
 
     public GlobalKeyboardHook() => _proc = HookCallback;
@@ -798,8 +944,15 @@ internal sealed class GlobalKeyboardHook : IDisposable
             var vkCode = Marshal.ReadInt32(lParam);
             var key = (Keys)vkCode;
             var msg = wParam.ToInt32();
-            if (msg == 0x0100 || msg == 0x0104) KeyDown?.Invoke(key);
-            if (msg == 0x0101 || msg == 0x0105) KeyUp?.Invoke(key);
+            if (msg == 0x0100 || msg == 0x0104)
+            {
+                if (_pressed.Add(key)) KeyDown?.Invoke(key);
+            }
+            if (msg == 0x0101 || msg == 0x0105)
+            {
+                _pressed.Remove(key);
+                KeyUp?.Invoke(key);
+            }
         }
         return CallNextHookEx(_hook, nCode, wParam, lParam);
     }
@@ -864,14 +1017,15 @@ internal sealed class HistoryStore
 
     public void Add(string text)
     {
-        File.AppendAllText(_path, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}{Environment.NewLine}{Environment.NewLine}");
+        File.AppendAllText(_path, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {text}{Environment.NewLine}{Environment.NewLine}", Encoding.UTF8);
     }
 
-    public string ReadAll() => File.Exists(_path) ? File.ReadAllText(_path) : string.Empty;
+    public string ReadAll() => FileUtil.ReadAllTextShared(_path);
 }
 
 internal sealed class AppLogger
 {
+    private readonly object _lock = new();
     public string LogPath { get; }
 
     public AppLogger()
@@ -887,7 +1041,43 @@ internal sealed class AppLogger
 
     private void Write(string level, string message)
     {
-        File.AppendAllText(LogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{level}] {message}{Environment.NewLine}");
+        lock (_lock)
+        {
+            File.AppendAllText(LogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [{level}] {message}{Environment.NewLine}", Encoding.UTF8);
+        }
+    }
+}
+
+internal static class FileUtil
+{
+    public static string ReadAllTextShared(string path)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(dir)) Directory.CreateDirectory(dir);
+            if (!File.Exists(path)) return string.Empty;
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            return reader.ReadToEnd();
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    public static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB"];
+        double value = bytes;
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+        return $"{value:F1} {units[unit]}";
     }
 }
 
@@ -906,14 +1096,118 @@ internal sealed class HistoryForm : Form
 
 internal sealed class LogForm : Form
 {
+    private readonly string _logPath;
+    private readonly TextBox _box;
+    private readonly Label _status;
+    private readonly CheckBox _autoScroll;
+    private readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
+    private DateTime _lastWriteUtc = DateTime.MinValue;
+    private long _lastLength = -1;
+
     public LogForm(string logPath)
     {
-        Text = "VoiceBridge - 日志";
-        Width = 860;
-        Height = 560;
+        _logPath = logPath;
+        Text = "VoiceBridge - 实时日志";
+        Width = 980;
+        Height = 640;
         Icon = AppIconFactory.CreateIcon();
-        var text = File.Exists(logPath) ? File.ReadAllText(logPath) : string.Empty;
-        var box = new TextBox { Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Both, Text = text };
-        Controls.Add(box);
+
+        _box = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            Dock = DockStyle.Fill,
+            ScrollBars = ScrollBars.Both,
+            WordWrap = false,
+            Font = new Font("Consolas", 9)
+        };
+
+        _status = new Label { Dock = DockStyle.Bottom, Height = 24, Padding = new Padding(8, 3, 8, 3) };
+        _autoScroll = new CheckBox { Text = "自动滚动", Checked = true, AutoSize = true };
+        var refresh = new Button { Text = "刷新", Width = 80 };
+        var copy = new Button { Text = "复制全部", Width = 90 };
+        var openDir = new Button { Text = "打开目录", Width = 90 };
+        var clear = new Button { Text = "清空日志", Width = 90 };
+
+        refresh.Click += (_, _) => RefreshLog(force: true);
+        copy.Click += (_, _) => { if (!string.IsNullOrEmpty(_box.Text)) Clipboard.SetText(_box.Text); };
+        openDir.Click += (_, _) => OpenLogInExplorer();
+        clear.Click += (_, _) =>
+        {
+            if (MessageBox.Show("确认清空当前日志？", "VoiceBridge", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) == DialogResult.OK)
+            {
+                File.WriteAllText(_logPath, string.Empty, Encoding.UTF8);
+                RefreshLog(force: true);
+            }
+        };
+
+        var toolbar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 42, Padding = new Padding(8), FlowDirection = FlowDirection.LeftToRight };
+        toolbar.Controls.Add(refresh);
+        toolbar.Controls.Add(copy);
+        toolbar.Controls.Add(openDir);
+        toolbar.Controls.Add(clear);
+        toolbar.Controls.Add(_autoScroll);
+
+        Controls.Add(_box);
+        Controls.Add(_status);
+        Controls.Add(toolbar);
+
+        _timer.Tick += (_, _) => RefreshLog(force: false);
+        Load += (_, _) =>
+        {
+            RefreshLog(force: true);
+            _timer.Start();
+        };
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        _timer.Stop();
+        _timer.Dispose();
+        base.OnFormClosed(e);
+    }
+
+    private void RefreshLog(bool force)
+    {
+        try
+        {
+            var info = new FileInfo(_logPath);
+            if (!info.Exists)
+            {
+                _box.Text = string.Empty;
+                _status.Text = "日志文件尚未创建。";
+                return;
+            }
+
+            if (!force && info.Length == _lastLength && info.LastWriteTimeUtc == _lastWriteUtc) return;
+            _lastLength = info.Length;
+            _lastWriteUtc = info.LastWriteTimeUtc;
+
+            _box.Text = FileUtil.ReadAllTextShared(_logPath);
+            if (_autoScroll.Checked)
+            {
+                _box.SelectionStart = _box.TextLength;
+                _box.ScrollToCaret();
+            }
+            _status.Text = $"实时刷新中 · {FileUtil.FormatBytes(info.Length)} · {info.LastWriteTime:yyyy-MM-dd HH:mm:ss}";
+        }
+        catch (Exception ex)
+        {
+            _status.Text = "读取日志失败：" + ex.Message;
+        }
+    }
+
+    private void OpenLogInExplorer()
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(_logPath) ?? Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            Directory.CreateDirectory(dir);
+            Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_logPath}\"") { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("打开目录失败：" + ex.Message, "VoiceBridge");
+        }
     }
 }
