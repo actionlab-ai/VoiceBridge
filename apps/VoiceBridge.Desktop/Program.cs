@@ -46,6 +46,8 @@ internal sealed class TrayAppContext : ApplicationContext
             Visible = true,
             ContextMenuStrip = BuildMenu()
         };
+        _tray.DoubleClick += (_, _) => ShowSettings();
+        _tray.ShowBalloonTip(2500, "VoiceBridge 已启动", "右键托盘图标打开设置；按住 F8 开始语音输入。", ToolTipIcon.Info);
 
         _keyboard = new GlobalKeyboardHook();
         _keyboard.KeyDown += HandleKeyDown;
@@ -68,12 +70,20 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void ShowSettings()
     {
-        using var form = new SettingsForm(_config);
-        if (form.ShowDialog() == DialogResult.OK)
+        try
         {
-            ConfigStore.Save(_config);
-            StartupManager.SetEnabled(_config.AutoStart);
-            _logger.Info("Settings saved from UI.");
+            using var form = new SettingsForm(_config);
+            if (form.ShowDialog() == DialogResult.OK)
+            {
+                ConfigStore.Save(_config);
+                StartupManager.SetEnabled(_config.AutoStart);
+                _logger.Info("Settings saved from UI.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("Failed to open settings", ex);
+            MessageBox.Show("打开设置失败：" + ex.Message, "VoiceBridge", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -274,7 +284,7 @@ internal sealed class SettingsForm : Form
 
         var hotkey = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160 };
         foreach (var k in new[] { Keys.F6, Keys.F7, Keys.F8, Keys.F9, Keys.F10, Keys.F11, Keys.F12 }) hotkey.Items.Add(k);
-        hotkey.SelectedItem = config.HoldKey;
+        hotkey.SelectedItem = hotkey.Items.Contains(config.HoldKey) ? config.HoldKey : Keys.F8;
 
         var autostart = new CheckBox { Text = "开机自启", Checked = config.AutoStart, AutoSize = true };
         var restoreClipboard = new CheckBox { Text = "粘贴后恢复原剪贴板", Checked = config.RestoreClipboard, AutoSize = true };
@@ -324,7 +334,18 @@ internal sealed class SettingsForm : Form
     }
 
     private static TextBox TextBox(string text) => new() { Text = text, Width = 400 };
-    private static NumericUpDown Numeric(int value, int min, int max) => new() { Value = Math.Clamp(value, min, max), Minimum = min, Maximum = max, Width = 160 };
+
+    private static NumericUpDown Numeric(int value, int min, int max)
+    {
+        var numeric = new NumericUpDown
+        {
+            Minimum = min,
+            Maximum = max,
+            Width = 160
+        };
+        numeric.Value = Math.Clamp(value, min, max);
+        return numeric;
+    }
 
     private static void AddRow(TableLayoutPanel table, string label, Control control)
     {
