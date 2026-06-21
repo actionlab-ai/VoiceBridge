@@ -6,6 +6,7 @@
     <AssemblyName>VoiceBridge</AssemblyName>
     <RootNamespace>VoiceBridge.Desktop</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <Version>0.1.0</Version>
     <Authors>actionlab-ai</Authors>
     <Product>VoiceBridge</Product>
@@ -14,4 +15,7 @@
   <ItemGroup>
     <PackageReference Include="NAudio" Version="2.2.1" />
   </ItemGroup>
+  <Target Name="GenerateAppIcon" BeforeTargets="PrepareForBuild">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)..\..\scripts\generate-icon.ps1&quot; -ProjectDir &quot;$(MSBuildProjectDirectory)&quot;" />
+  </Target>
 </Project>
