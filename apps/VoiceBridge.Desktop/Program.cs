@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -16,6 +17,13 @@ internal static class Program
     private static void Main()
     {
         ApplicationConfiguration.Initialize();
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, e) => MessageBox.Show("VoiceBridge 运行异常：" + e.Exception.Message, "VoiceBridge", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            if (e.ExceptionObject is Exception ex) MessageBox.Show("VoiceBridge 运行异常：" + ex.Message, "VoiceBridge", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        };
+
         using var context = new TrayAppContext();
         Application.Run(context);
     }
@@ -25,11 +33,14 @@ internal sealed class TrayAppContext : ApplicationContext
 {
     private readonly AppConfig _config;
     private readonly NotifyIcon _tray;
+    private readonly Icon _appIcon;
     private readonly AppLogger _logger;
     private readonly HistoryStore _history;
     private readonly GlobalKeyboardHook _keyboard;
+    private readonly StatusOverlay _overlay;
     private AudioRecorder? _recorder;
     private bool _recording;
+    private bool _recognizing;
     private string _lastText = string.Empty;
 
     public TrayAppContext()
@@ -37,17 +48,19 @@ internal sealed class TrayAppContext : ApplicationContext
         _config = ConfigStore.Load();
         _logger = new AppLogger();
         _history = new HistoryStore();
+        _appIcon = AppIconFactory.CreateIcon();
+        _overlay = new StatusOverlay();
         StartupManager.SetEnabled(_config.AutoStart);
 
         _tray = new NotifyIcon
         {
             Text = "VoiceBridge 语音桥",
-            Icon = SystemIcons.Application,
+            Icon = _appIcon,
             Visible = true,
             ContextMenuStrip = BuildMenu()
         };
         _tray.DoubleClick += (_, _) => ShowSettings();
-        _tray.ShowBalloonTip(2500, "VoiceBridge 已启动", "右键托盘图标打开设置；按住 F8 开始语音输入。", ToolTipIcon.Info);
+        _tray.ShowBalloonTip(2500, "VoiceBridge 已启动", $"双击托盘打开设置；按住 {_config.HoldKey} 开始语音输入。", ToolTipIcon.Info);
 
         _keyboard = new GlobalKeyboardHook();
         _keyboard.KeyDown += HandleKeyDown;
@@ -76,8 +89,8 @@ internal sealed class TrayAppContext : ApplicationContext
             if (form.ShowDialog() == DialogResult.OK)
             {
                 ConfigStore.Save(_config);
-                StartupManager.SetEnabled(_config.AutoStart);
-                _logger.Info("Settings saved from UI.");
+                ApplyRuntimeSettings(showTip: true);
+                _logger.Info("Settings saved and applied from UI.");
             }
         }
         catch (Exception ex)
@@ -87,9 +100,21 @@ internal sealed class TrayAppContext : ApplicationContext
         }
     }
 
+    private void ApplyRuntimeSettings(bool showTip)
+    {
+        StartupManager.SetEnabled(_config.AutoStart);
+        _tray.Text = "VoiceBridge 语音桥";
+        _tray.ContextMenuStrip = BuildMenu();
+        if (showTip)
+        {
+            _tray.ShowBalloonTip(1800, "设置已生效", $"热键：{_config.HoldKey}；模型：{_config.ModelName}", ToolTipIcon.Info);
+            ShowOverlay("设置已生效", $"热键 {_config.HoldKey} · 模型 {_config.ModelName}", OverlayKind.Success, 1600);
+        }
+    }
+
     private void HandleKeyDown(Keys key)
     {
-        if (key == _config.HoldKey && !_recording)
+        if (key == _config.HoldKey && !_recording && !_recognizing)
         {
             BeginRecord();
             return;
@@ -101,7 +126,7 @@ internal sealed class TrayAppContext : ApplicationContext
             return;
         }
 
-        if (key == Keys.F9)
+        if (key == Keys.F9 && !_recording && !_recognizing)
         {
             _ = PasteLastAsync();
             return;
@@ -111,6 +136,7 @@ internal sealed class TrayAppContext : ApplicationContext
         {
             InputInjector.ReleaseModifiers();
             _logger.Info("Released modifier keys.");
+            ShowOverlay("已释放修饰键", "Ctrl / Alt / Win / Shift 已释放", OverlayKind.Info, 1200);
         }
     }
 
@@ -130,12 +156,14 @@ internal sealed class TrayAppContext : ApplicationContext
             _recorder = new AudioRecorder(_config.MicrophoneDeviceNumber, _config.SampleRate, _config.Channels, _logger);
             _recorder.Start();
             _tray.Text = "VoiceBridge 正在录音...";
+            ShowOverlay("正在录音", $"{_config.HoldKey} 松开后识别 · {_config.ModelName}", OverlayKind.Recording);
             _logger.Info("Recording started.");
         }
         catch (Exception ex)
         {
             _recording = false;
             _logger.Error("Failed to start recording", ex);
+            ShowOverlay("录音启动失败", ex.Message, OverlayKind.Error, 3000);
             _tray.ShowBalloonTip(2000, "VoiceBridge", "录音启动失败：" + ex.Message, ToolTipIcon.Error);
         }
     }
@@ -147,6 +175,7 @@ internal sealed class TrayAppContext : ApplicationContext
             _recorder?.Cancel();
             _recording = false;
             _tray.Text = "VoiceBridge 语音桥";
+            ShowOverlay("已取消", "本次语音输入已取消", OverlayKind.Info, 1200);
             _logger.Info("Recording cancelled.");
         }
         catch (Exception ex)
@@ -160,9 +189,16 @@ internal sealed class TrayAppContext : ApplicationContext
         try
         {
             _recording = false;
+            _recognizing = true;
             _tray.Text = "VoiceBridge 正在识别...";
+            ShowOverlay("正在识别", $"{_config.ModelName} · {_config.Endpoint}", OverlayKind.Recognizing);
+
             var wav = await (_recorder?.StopAsync() ?? Task.FromResult(string.Empty));
-            if (string.IsNullOrWhiteSpace(wav) || !File.Exists(wav)) return;
+            if (string.IsNullOrWhiteSpace(wav) || !File.Exists(wav))
+            {
+                ShowOverlay("没有录音文件", "没有可识别的音频", OverlayKind.Info, 1800);
+                return;
+            }
 
             var client = new AsrClient(_config, _logger);
             var text = await client.TranscribeAsync(wav);
@@ -170,6 +206,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
             if (string.IsNullOrWhiteSpace(text))
             {
+                ShowOverlay("未识别到文本", "请靠近麦克风或检查输入设备", OverlayKind.Info, 2200);
                 _tray.ShowBalloonTip(2000, "VoiceBridge", "没有识别到文本", ToolTipIcon.Info);
                 return;
             }
@@ -177,23 +214,44 @@ internal sealed class TrayAppContext : ApplicationContext
             _lastText = text;
             _history.Add(text);
             await InputInjector.PasteTextAsync(text, _config.RestoreClipboard);
+            ShowOverlay("已输入", Shorten(text, 80), OverlayKind.Success, 2200);
             _logger.Info("Recognition completed: " + text);
         }
         catch (Exception ex)
         {
             _logger.Error("Recognition failed", ex);
+            ShowOverlay("识别失败", ex.Message, OverlayKind.Error, 3600);
             _tray.ShowBalloonTip(3000, "VoiceBridge", "识别失败：" + ex.Message, ToolTipIcon.Error);
         }
         finally
         {
+            _recognizing = false;
             _tray.Text = "VoiceBridge 语音桥";
         }
     }
 
     private async Task PasteLastAsync()
     {
-        if (string.IsNullOrWhiteSpace(_lastText)) return;
+        if (string.IsNullOrWhiteSpace(_lastText))
+        {
+            ShowOverlay("暂无上次结果", "先完成一次语音识别后再重贴", OverlayKind.Info, 1400);
+            return;
+        }
+
         await InputInjector.PasteTextAsync(_lastText, _config.RestoreClipboard);
+        ShowOverlay("已重新粘贴", Shorten(_lastText, 80), OverlayKind.Success, 1400);
+    }
+
+    private void ShowOverlay(string title, string detail, OverlayKind kind, int autoHideMs = 0)
+    {
+        if (!_config.ShowOverlay) return;
+        _overlay.ShowStatus(title, detail, kind, autoHideMs);
+    }
+
+    private static string Shorten(string text, int max)
+    {
+        text = text.Replace("\r", " ").Replace("\n", " ").Trim();
+        return text.Length <= max ? text : text[..max] + "…";
     }
 
     protected override void Dispose(bool disposing)
@@ -201,8 +259,10 @@ internal sealed class TrayAppContext : ApplicationContext
         if (disposing)
         {
             _keyboard.Dispose();
+            _overlay.Dispose();
             _tray.Visible = false;
             _tray.Dispose();
+            _appIcon.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -221,6 +281,7 @@ internal sealed class AppConfig
     public int Channels { get; set; } = 1;
     public bool RestoreClipboard { get; set; } = true;
     public bool EnablePostProcess { get; set; } = true;
+    public bool ShowOverlay { get; set; } = true;
     public string Prompt { get; set; } = "请把这段音频完整转写成文字，只输出转写结果。语言自动识别。";
     public int MaxTokens { get; set; } = 2048;
 }
@@ -262,18 +323,19 @@ internal sealed class SettingsForm : Form
     public SettingsForm(AppConfig config)
     {
         Text = "VoiceBridge - 设置";
-        Width = 620;
-        Height = 520;
+        Width = 660;
+        Height = 590;
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
+        Icon = AppIconFactory.CreateIcon();
 
         var endpoint = TextBox(config.Endpoint);
         var model = TextBox(config.ModelName);
         var apiKey = TextBox(config.ApiKey); apiKey.UseSystemPasswordChar = true;
         var timeout = Numeric(config.TimeoutSeconds, 5, 600);
-        var mic = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 400 };
+        var mic = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 420 };
         mic.Items.Add(new DeviceItem(-1, "系统默认麦克风"));
         for (var i = 0; i < WaveInEvent.DeviceCount; i++)
         {
@@ -289,11 +351,12 @@ internal sealed class SettingsForm : Form
         var autostart = new CheckBox { Text = "开机自启", Checked = config.AutoStart, AutoSize = true };
         var restoreClipboard = new CheckBox { Text = "粘贴后恢复原剪贴板", Checked = config.RestoreClipboard, AutoSize = true };
         var postProcess = new CheckBox { Text = "启用技术词后处理", Checked = config.EnablePostProcess, AutoSize = true };
-        var prompt = new TextBox { Text = config.Prompt, Multiline = true, Width = 400, Height = 70, ScrollBars = ScrollBars.Vertical };
+        var showOverlay = new CheckBox { Text = "显示语音状态浮窗", Checked = config.ShowOverlay, AutoSize = true };
+        var prompt = new TextBox { Text = config.Prompt, Multiline = true, Width = 420, Height = 70, ScrollBars = ScrollBars.Vertical };
         var maxTokens = Numeric(config.MaxTokens, 64, 8192);
 
-        var table = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 2, RowCount = 11 };
-        table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        var table = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 2, RowCount = 12 };
+        table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 160));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         AddRow(table, "服务地址", endpoint);
         AddRow(table, "模型名称", model);
@@ -306,6 +369,15 @@ internal sealed class SettingsForm : Form
         AddRow(table, "", autostart);
         AddRow(table, "", restoreClipboard);
         AddRow(table, "", postProcess);
+        AddRow(table, "", showOverlay);
+
+        var hint = new Label
+        {
+            Dock = DockStyle.Bottom,
+            Height = 34,
+            Padding = new Padding(16, 4, 16, 4),
+            Text = "保存后立即热加载：热键、模型地址、API Key、超时时间、麦克风等均不需要重启。"
+        };
 
         var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Bottom, Height = 52, Padding = new Padding(8) };
         var ok = new Button { Text = "保存", Width = 90, DialogResult = DialogResult.OK };
@@ -325,15 +397,17 @@ internal sealed class SettingsForm : Form
             config.AutoStart = autostart.Checked;
             config.RestoreClipboard = restoreClipboard.Checked;
             config.EnablePostProcess = postProcess.Checked;
+            config.ShowOverlay = showOverlay.Checked;
             config.Prompt = prompt.Text.Trim();
             config.MaxTokens = (int)maxTokens.Value;
         };
 
         Controls.Add(table);
+        Controls.Add(hint);
         Controls.Add(buttons);
     }
 
-    private static TextBox TextBox(string text) => new() { Text = text, Width = 400 };
+    private static TextBox TextBox(string text) => new() { Text = text, Width = 420 };
 
     private static NumericUpDown Numeric(int value, int min, int max)
     {
@@ -383,6 +457,143 @@ internal sealed class SettingsForm : Form
     {
         public override string ToString() => Name;
     }
+}
+
+internal sealed class StatusOverlay : Form
+{
+    private readonly Label _title;
+    private readonly Label _detail;
+    private readonly System.Windows.Forms.Timer _hideTimer = new();
+
+    public StatusOverlay()
+    {
+        Width = 420;
+        Height = 96;
+        StartPosition = FormStartPosition.Manual;
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        TopMost = true;
+        BackColor = Color.FromArgb(32, 32, 36);
+        Opacity = 0.94;
+        Padding = new Padding(16);
+        Icon = AppIconFactory.CreateIcon();
+
+        _title = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 32,
+            ForeColor = Color.White,
+            Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 12, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+        _detail = new Label
+        {
+            Dock = DockStyle.Fill,
+            ForeColor = Color.Gainsboro,
+            Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 9),
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+
+        Controls.Add(_detail);
+        Controls.Add(_title);
+        _hideTimer.Tick += (_, _) =>
+        {
+            _hideTimer.Stop();
+            Hide();
+        };
+    }
+
+    public void ShowStatus(string title, string detail, OverlayKind kind, int autoHideMs = 0)
+    {
+        _title.Text = IconText(kind) + " " + title;
+        _detail.Text = detail;
+        Location = CalculateLocation();
+        Show();
+        BringToFront();
+
+        _hideTimer.Stop();
+        if (autoHideMs > 0)
+        {
+            _hideTimer.Interval = autoHideMs;
+            _hideTimer.Start();
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        using var path = RoundedRect(ClientRectangle, 18);
+        using var pen = new Pen(Color.FromArgb(80, 255, 255, 255));
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        e.Graphics.DrawPath(pen, path);
+    }
+
+    private static Point CalculateLocation()
+    {
+        var area = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1280, 720);
+        return new Point(area.Left + (area.Width - 420) / 2, area.Bottom - 150);
+    }
+
+    private static string IconText(OverlayKind kind) => kind switch
+    {
+        OverlayKind.Recording => "●",
+        OverlayKind.Recognizing => "…",
+        OverlayKind.Success => "✓",
+        OverlayKind.Error => "!",
+        _ => "i"
+    };
+
+    private static GraphicsPath RoundedRect(Rectangle bounds, int radius)
+    {
+        var path = new GraphicsPath();
+        var d = radius * 2;
+        path.AddArc(bounds.X, bounds.Y, d, d, 180, 90);
+        path.AddArc(bounds.Right - d, bounds.Y, d, d, 270, 90);
+        path.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
+        path.AddArc(bounds.X, bounds.Bottom - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+}
+
+internal enum OverlayKind
+{
+    Info,
+    Recording,
+    Recognizing,
+    Success,
+    Error
+}
+
+internal static class AppIconFactory
+{
+    public static Icon CreateIcon()
+    {
+        using var bmp = new Bitmap(32, 32);
+        using var g = Graphics.FromImage(bmp);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.Clear(Color.Transparent);
+        using var bg = new LinearGradientBrush(new Rectangle(0, 0, 32, 32), Color.FromArgb(33, 132, 255), Color.FromArgb(111, 66, 193), 45f);
+        g.FillEllipse(bg, 2, 2, 28, 28);
+        using var white = new Pen(Color.White, 2.4f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+        g.DrawLine(white, 16, 8, 16, 18);
+        g.DrawArc(white, 10, 10, 12, 12, 0, 180);
+        g.DrawLine(white, 16, 22, 16, 25);
+        g.DrawLine(white, 11, 25, 21, 25);
+        var hIcon = bmp.GetHicon();
+        try
+        {
+            using var icon = Icon.FromHandle(hIcon);
+            return (Icon)icon.Clone();
+        }
+        finally
+        {
+            DestroyIcon(hIcon);
+        }
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
 }
 
 internal sealed class AudioRecorder
@@ -642,51 +853,67 @@ internal static class StartupManager
 
 internal sealed class HistoryStore
 {
-    private readonly string _path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VoiceBridge", "history.txt");
+    private readonly string _path;
+
+    public HistoryStore()
+    {
+        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VoiceBridge");
+        Directory.CreateDirectory(dir);
+        _path = Path.Combine(dir, "history.txt");
+    }
 
     public void Add(string text)
     {
-        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(_path)!);
-        File.AppendAllText(_path, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}{Environment.NewLine}");
+        File.AppendAllText(_path, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}{Environment.NewLine}{Environment.NewLine}");
     }
 
     public string ReadAll() => File.Exists(_path) ? File.ReadAllText(_path) : string.Empty;
 }
 
+internal sealed class AppLogger
+{
+    public string LogPath { get; }
+
+    public AppLogger()
+    {
+        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VoiceBridge");
+        Directory.CreateDirectory(dir);
+        LogPath = Path.Combine(dir, "voicebridge.log");
+    }
+
+    public void Info(string message) => Write("INFO", message);
+
+    public void Error(string message, Exception ex) => Write("ERROR", message + Environment.NewLine + ex);
+
+    private void Write(string level, string message)
+    {
+        File.AppendAllText(LogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{level}] {message}{Environment.NewLine}");
+    }
+}
+
 internal sealed class HistoryForm : Form
 {
-    public HistoryForm(HistoryStore store)
+    public HistoryForm(HistoryStore history)
     {
         Text = "VoiceBridge - 识别历史";
         Width = 760;
         Height = 520;
-        var box = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, Dock = DockStyle.Fill, Text = store.ReadAll() };
+        Icon = AppIconFactory.CreateIcon();
+        var box = new TextBox { Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Both, Text = history.ReadAll() };
         Controls.Add(box);
     }
 }
 
 internal sealed class LogForm : Form
 {
-    public LogForm(string path)
+    public LogForm(string logPath)
     {
         Text = "VoiceBridge - 日志";
-        Width = 760;
-        Height = 520;
-        var box = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, Dock = DockStyle.Fill, Text = File.Exists(path) ? File.ReadAllText(path) : string.Empty };
+        Width = 860;
+        Height = 560;
+        Icon = AppIconFactory.CreateIcon();
+        var text = File.Exists(logPath) ? File.ReadAllText(logPath) : string.Empty;
+        var box = new TextBox { Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Both, Text = text };
         Controls.Add(box);
-    }
-}
-
-internal sealed class AppLogger
-{
-    public string LogPath { get; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VoiceBridge", "voicebridge.log");
-
-    public void Info(string message) => Write("INFO", message);
-    public void Error(string message, Exception ex) => Write("ERROR", message + Environment.NewLine + ex);
-
-    private void Write(string level, string message)
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
-        File.AppendAllText(LogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{level}] {message}{Environment.NewLine}");
     }
 }
