@@ -1,0 +1,10 @@
+bin/
+obj/
+artifacts/
+.vs/
+*.user
+*.suo
+*.log
+*.nupkg
+TestResults/
+.vscode/
