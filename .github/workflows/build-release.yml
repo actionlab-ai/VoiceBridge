@@ -31,11 +31,9 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Restore
-        run: dotnet restore apps/VoiceBridge.Desktop/VoiceBridge.Desktop.csproj
-
       - name: Publish win-x64
-        run: dotnet publish apps/VoiceBridge.Desktop/VoiceBridge.Desktop.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o artifacts/publish
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
 
       - name: Package
         shell: pwsh
