@@ -4,6 +4,8 @@ $root = Split-Path -Parent $PSScriptRoot
 $project = Join-Path $root "apps/VoiceBridge.Desktop/VoiceBridge.Desktop.csproj"
 $out = Join-Path $root "artifacts/publish"
 
+& (Join-Path $root "scripts/generate-icon.ps1") -ProjectDir (Join-Path $root "apps/VoiceBridge.Desktop")
+
 if (Test-Path $out) {
   Remove-Item $out -Recurse -Force
 }
