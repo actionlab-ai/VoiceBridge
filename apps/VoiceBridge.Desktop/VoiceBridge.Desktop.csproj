@@ -7,7 +7,7 @@
     <RootNamespace>VoiceBridge.Desktop</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Authors>actionlab-ai</Authors>
     <Product>VoiceBridge</Product>
     <Description>Windows voice dictation bridge for MiMo and OpenAI-compatible ASR services.</Description>
