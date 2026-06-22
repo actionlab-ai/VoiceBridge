@@ -63,10 +63,6 @@ if (-not $content.Contains($needle)) {
 }
 
 $content = $content.Replace($needle, $replacement)
-$content = $content.Replace(
-  'public string Prompt { get; set; } = "请把这段音频完整转写成文字，只输出转写结果。语言自动识别。";',
-  'public string Prompt { get; set; } = "请把这段音频完整转写成文字，只输出转写结果，不要输出 language、Chinese、<asr_text> 或任何标签。语言自动识别。";'
-)
 
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($programPath, $content, $utf8NoBom)
