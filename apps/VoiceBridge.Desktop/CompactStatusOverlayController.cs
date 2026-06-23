@@ -13,6 +13,7 @@ internal static class CompactStatusOverlayController
     private const string VisualizerName = "__VoiceBridgeCompactVisualizer";
     private static readonly System.Windows.Forms.Timer AnimationTimer = new() { Interval = 40 };
     private static bool _started;
+    private static bool _applying;
     private static int _frame;
 
     [ModuleInitializer]
@@ -23,6 +24,7 @@ internal static class CompactStatusOverlayController
 
     public static void TryApplyFromHandle(IntPtr handle)
     {
+        if (_applying) return;
         if (Control.FromHandle(handle) is Form form && form.GetType().Name == "StatusOverlay")
         {
             ApplyCompactVisualizer(form, allowHidden: true);
@@ -53,9 +55,10 @@ internal static class CompactStatusOverlayController
 
     private static void ApplyCompactVisualizer(Form overlay, bool allowHidden)
     {
-        if (overlay.IsDisposed) return;
+        if (_applying || overlay.IsDisposed) return;
         if (!allowHidden && !overlay.Visible) return;
 
+        _applying = true;
         var labels = overlay.Controls.OfType<Label>().ToArray();
         var mode = NormalizeMode(
             string.Join(" ", labels.Select(x => x.Text ?? string.Empty)),
@@ -101,6 +104,7 @@ internal static class CompactStatusOverlayController
         finally
         {
             overlay.ResumeLayout(performLayout: false);
+            _applying = false;
         }
     }
 
