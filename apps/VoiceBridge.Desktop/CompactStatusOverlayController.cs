@@ -11,7 +11,7 @@ internal static class CompactStatusOverlayController
     private const int CompactWidth = 168;
     private const int CompactHeight = 42;
     private const string VisualizerName = "__VoiceBridgeCompactVisualizer";
-    private static readonly System.Windows.Forms.Timer AnimationTimer = new() { Interval = 50 };
+    private static readonly System.Windows.Forms.Timer AnimationTimer = new() { Interval = 40 };
     private static bool _started;
     private static int _frame;
 
@@ -21,31 +21,40 @@ internal static class CompactStatusOverlayController
         Application.Idle += StartAfterMessageLoopReady;
     }
 
+    public static void TryApplyFromHandle(IntPtr handle)
+    {
+        if (Control.FromHandle(handle) is Form form && form.GetType().Name == "StatusOverlay")
+        {
+            ApplyCompactVisualizer(form, allowHidden: true);
+        }
+    }
+
     private static void StartAfterMessageLoopReady(object? sender, EventArgs e)
     {
         if (_started) return;
         _started = true;
         Application.Idle -= StartAfterMessageLoopReady;
-        Application.Idle += (_, _) => Tick();
-        AnimationTimer.Tick += (_, _) => Tick();
+        Application.AddMessageFilter(new OverlayMessageFilter());
+        AnimationTimer.Tick += (_, _) => TickVisibleOverlays();
         AnimationTimer.Start();
     }
 
-    private static void Tick()
+    private static void TickVisibleOverlays()
     {
         _frame++;
         foreach (var form in Application.OpenForms.Cast<Form>().ToArray())
         {
             if (form.GetType().Name == "StatusOverlay")
             {
-                ApplyCompactVisualizer(form);
+                ApplyCompactVisualizer(form, allowHidden: false);
             }
         }
     }
 
-    private static void ApplyCompactVisualizer(Form overlay)
+    private static void ApplyCompactVisualizer(Form overlay, bool allowHidden)
     {
-        if (overlay.IsDisposed || !overlay.Visible) return;
+        if (overlay.IsDisposed) return;
+        if (!allowHidden && !overlay.Visible) return;
 
         var labels = overlay.Controls.OfType<Label>().ToArray();
         var mode = NormalizeMode(
@@ -136,9 +145,27 @@ internal static class CompactStatusOverlayController
         path.AddArc(bounds.X, bounds.Y, d, d, 180, 90);
         path.AddArc(bounds.Right - d, bounds.Y, d, d, 270, 90);
         path.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
-        path.AddArc(bounds.X, bounds.Bottom - d, bounds.Bottom - d >= bounds.Y ? d : 0, d, 90, 90);
+        path.AddArc(bounds.X, bounds.Bottom - d, d, d, 90, 90);
         path.CloseFigure();
         return path;
+    }
+
+    private sealed class OverlayMessageFilter : IMessageFilter
+    {
+        private const int WmSize = 0x0005;
+        private const int WmShowWindow = 0x0018;
+        private const int WmWindowPosChanging = 0x0046;
+        private const int WmWindowPosChanged = 0x0047;
+
+        public bool PreFilterMessage(ref Message m)
+        {
+            if (m.Msg is WmShowWindow or WmSize or WmWindowPosChanging or WmWindowPosChanged)
+            {
+                TryApplyFromHandle(m.HWnd);
+            }
+
+            return false;
+        }
     }
 }
 
