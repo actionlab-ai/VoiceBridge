@@ -184,20 +184,22 @@ internal enum CompactOverlayMode
 
 internal sealed class CompactOverlayVisualizer : Control
 {
+    private static readonly Color CapsuleBackColor = Color.FromArgb(38, 38, 42);
+
     public CompactOverlayMode Mode { get; set; } = CompactOverlayMode.Working;
     public int Frame { get; set; }
 
     public CompactOverlayVisualizer()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
-        BackColor = Color.Transparent;
+        BackColor = CapsuleBackColor;
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.Clear(Color.FromArgb(38, 38, 42));
+        e.Graphics.Clear(CapsuleBackColor);
 
         using var border = new Pen(Color.FromArgb(82, 255, 255, 255), 1f);
         using var borderPath = RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), Height / 2);
